@@ -1,0 +1,27 @@
+[Unit]
+Description=ailab vLLM model server: Qwen3.8-27B NVFP4 on http://TAILSCALE_IP:8000/v1
+After=docker.service tailscaled.service network-online.target ailab-memwatch.service
+Wants=network-online.target tailscaled.service ailab-memwatch.service
+Requires=docker.service
+# give up after 3 failed starts within an hour (no restart loops while you're away)
+StartLimitIntervalSec=3600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=YOUR_USER
+Group=YOUR_USER
+SupplementaryGroups=docker
+Environment=HOME=/home/YOUR_USER
+Environment=SUPERVISED=1
+# 0.34 share (~41 GiB) + reserve; waits if Qwen3.6 is mid-load (two-model setup)
+ExecStartPre=/home/YOUR_USER/ailab/safety/vllm-precheck.sh 65 ailab-vllm-qwen36:8001
+ExecStart=/home/YOUR_USER/ailab/vllm/qwen38-27b.sh
+ExecStop=/usr/bin/docker stop -t 30 vllm-qwen38-27b
+Restart=on-failure
+RestartSec=60
+TimeoutStartSec=1200
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

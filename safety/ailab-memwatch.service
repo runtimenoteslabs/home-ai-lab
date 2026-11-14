@@ -1,0 +1,18 @@
+[Unit]
+Description=ailab memory watchdog (stops GPU models before unified memory runs out)
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+# services to stop on an emergency (the containers themselves are stopped by label ailab.gpu=true)
+Environment="UNITS=ailab-vllm.service ailab-vllm-qwen36.service"
+ExecStart=/usr/local/sbin/ailab-memwatch
+Restart=always
+RestartSec=5
+# keep the watchdog itself alive under memory pressure
+OOMScoreAdjust=-1000
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

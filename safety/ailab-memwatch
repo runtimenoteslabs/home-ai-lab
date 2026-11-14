@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# ailab-memwatch: stop GPU model containers cleanly before unified memory runs out.
+# Running out of memory on a GB10 freezes the whole box (SSH included), so this
+# acts first. Modelled on Mia's memwatch.sh. Runs as root under systemd and logs
+# to the journal:  journalctl -u ailab-memwatch
+#
+# Stops when, for DEBOUNCE consecutive 1 s samples, either:
+#   MemAvailable < MIN_AVAIL_GIB, or
+#   MemFree < MIN_FREE_GIB while MemAvailable < FREE_GATE_GIB.
+# It never restarts anything. After an emergency stop the models stay down until
+# reboot or:  sudo rm /run/ailab-memwatch.emergency && sudo systemctl start ailab-vllm
+set -u
+MIN_AVAIL_GIB=${MIN_AVAIL_GIB:-6}
+MIN_FREE_GIB=${MIN_FREE_GIB:-2}
+FREE_GATE_GIB=${FREE_GATE_GIB:-10}
+WARN_AVAIL_GIB=${WARN_AVAIL_GIB:-15}
+DEBOUNCE=${DEBOUNCE:-5}
+ARCHIVE_DIR=${ARCHIVE_DIR:-/home/YOUR_USER/ailab/logs/memwatch}
+UNITS=${UNITS:-ailab-vllm.service}
+MARKER=/run/ailab-memwatch.emergency
+G=1048576   # KiB per GiB
+
+kib()   { awk -v k="$1:" '$1==k{print $2}' /proc/meminfo; }
+gib()   { awk -v v="$1" 'BEGIN{printf "%.1f", v/1048576}'; }
+nverr() { dmesg 2>/dev/null | grep -c NV_ERR_NO_MEMORY; }
+gpu_containers() { docker ps --filter label=ailab.gpu=true --format '{{.Names}}' 2>/dev/null; }
+
+emergency() {
+  local reason="$1" ts c u
+  ts=$(date +%Y%m%d-%H%M%S)
+  echo "EMERGENCY: $reason"
+  echo "$ts $reason" > "$MARKER"          # blocks automatic restarts until reboot
+  mkdir -p "$ARCHIVE_DIR"
+  for c in $(gpu_containers); do
+    docker logs --tail 3000 "$c" > "$ARCHIVE_DIR/$c-$ts.log" 2>&1
+    docker stop -t 30 "$c" >/dev/null 2>&1 &
+  done
+  wait
+  for u in $UNITS; do systemctl stop --no-block "$u" 2>/dev/null; done
+  echo "WATCHDOG EMERGENCY STOP: $reason. Logs: $ARCHIVE_DIR. Models stay stopped until reboot or 'sudo rm $MARKER'."
+  if [ -x /usr/local/sbin/ailab-alert ]; then /usr/local/sbin/ailab-alert "ailab memwatch emergency stop: $reason" || true; fi
+}
+
+echo "memwatch started: stop if MemAvailable < ${MIN_AVAIL_GIB} GiB, or MemFree < ${MIN_FREE_GIB} GiB while MemAvailable < ${FREE_GATE_GIB} GiB, for ${DEBOUNCE} s; warn below ${WARN_AVAIL_GIB} GiB"
+below=0; warned=0; idle_note=0; tick=0
+nv_prev=$(nverr)
+while true; do
+  a=$(kib MemAvailable); f=$(kib MemFree)
+  trig=""
+  if (( a < MIN_AVAIL_GIB*G )); then
+    trig="MemAvailable $(gib "$a") GiB < ${MIN_AVAIL_GIB} GiB"
+  elif (( f < MIN_FREE_GIB*G && a < FREE_GATE_GIB*G )); then
+    trig="MemFree $(gib "$f") GiB < ${MIN_FREE_GIB} GiB with MemAvailable $(gib "$a") GiB"
+  fi
+  if [[ -n $trig ]]; then
+    below=$((below+1))
+    if (( below >= DEBOUNCE )); then
+      if [[ -n $(gpu_containers) ]]; then
+        emergency "$trig"; idle_note=0
+      elif (( idle_note == 0 )); then
+        echo "below floor ($trig) but no ailab GPU containers are running; nothing to stop"; idle_note=1
+      fi
+      below=0
+    fi
+  elif (( below > 0 )); then
+    echo "recovered after $below sub-floor sample(s)"; below=0
+  fi
+  if (( a < WARN_AVAIL_GIB*G )); then
+    if (( warned == 0 )); then echo "WARNING: MemAvailable $(gib "$a") GiB < ${WARN_AVAIL_GIB} GiB"; warned=1; fi
+  elif (( a > (WARN_AVAIL_GIB+5)*G )); then
+    warned=0
+  fi
+  tick=$((tick+1))
+  if (( tick % 10 == 0 )); then
+    n=$(nverr)
+    if (( n > nv_prev )); then echo "NV_ERR_NO_MEMORY in kernel log: $nv_prev -> $n (MemAvailable $(gib "$a") GiB)"; nv_prev=$n; fi
+  fi
+  if (( tick % 300 == 0 )); then echo "status: MemAvailable $(gib "$a") GiB, MemFree $(gib "$f") GiB"; fi
+  sleep 1
+done

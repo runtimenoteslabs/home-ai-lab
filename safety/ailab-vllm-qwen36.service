@@ -1,0 +1,27 @@
+[Unit]
+Description=ailab vLLM model server: Qwen3.6-35B-A3B NVFP4 on http://TAILSCALE_IP:8001/v1
+After=docker.service tailscaled.service network-online.target ailab-memwatch.service ailab-vllm.service
+Wants=network-online.target tailscaled.service ailab-memwatch.service
+Requires=docker.service
+StartLimitIntervalSec=3600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=YOUR_USER
+Group=YOUR_USER
+SupplementaryGroups=docker
+Environment=HOME=/home/YOUR_USER
+Environment=SUPERVISED=1
+# needs ~43 GiB (measured: 72 -> 29 GiB free); 62 leaves >= ~19 GiB after start even if 27B has grown.
+# At boot, waits for Qwen3.8-27B to finish loading first.
+ExecStartPre=/home/YOUR_USER/ailab/safety/vllm-precheck.sh 62 ailab-vllm:8000
+ExecStart=/home/YOUR_USER/ailab/vllm/qwen36-35b.sh
+ExecStop=/usr/bin/docker stop -t 30 vllm-qwen36
+Restart=on-failure
+RestartSec=60
+TimeoutStartSec=1200
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

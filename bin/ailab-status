@@ -1,0 +1,650 @@
+#!/usr/bin/env python3
+"""ailab-status: one-screen status of the ailab GB10 box (memory, GPU, services, models, speed).
+
+  ailab-status              snapshot
+  ailab-status -w [N]       refresh every N seconds (default 5); Ctrl-C to quit
+  ailab-status --speed      also run a short live speed test on each idle model (~10 s, uses the GPU)
+  ailab-status --no-color
+
+Standard library only, runs as the normal user (docker + adm groups), changes nothing. Reads /proc,
+nvidia-smi, docker, systemctl, journalctl, tailscale, and each model server's /metrics and /v1/models
+(API key from ~/ailab/vllm/env). Source: ~/ailab/bin/ailab-status (copy in ailab-config/bin/).
+"""
+import argparse
+import glob
+import json
+import os
+import random
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+from datetime import datetime, timezone
+
+HOME = os.path.expanduser("~")
+MODELS_DIR = os.path.join(HOME, "models")
+ENV_FILE = os.path.join(HOME, "ailab/vllm/env")
+BENCH_DIR = os.path.join(HOME, "ailab/bench/results")
+MEMWATCH = "/usr/local/sbin/ailab-memwatch"
+EMERGENCY = "/run/ailab-memwatch.emergency"
+RESERVE_GIB = 26          # Mia's host-reserve guideline (26-30 GiB): below this, yellow
+CORE_UNITS = ["ailab-memwatch", "tailscaled", "ssh.socket", "docker"]   # Ubuntu 24.04 starts sshd via ssh.socket
+
+
+# ---------------------------------------------------------------- helpers
+class C:
+    on = sys.stdout.isatty()
+
+
+def paint(code, s):
+    return f"\033[{code}m{s}\033[0m" if C.on else str(s)
+
+
+def green(s): return paint("32", s)
+def yellow(s): return paint("33", s)
+def red(s): return paint("31", s)
+def bold(s): return paint("1", s)
+def dim(s): return paint("2", s)
+
+
+def run(cmd, timeout=10):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def http(url, key=None, timeout=3):
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}"} if key else {})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read().decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def api_key():
+    try:
+        with open(ENV_FILE) as f:
+            for line in f:
+                if line.startswith("VLLM_API_KEY="):
+                    return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return None
+
+
+def fmt_dur(s):
+    if s is None or s < 0:
+        return "?"
+    s = int(s)
+    d, h, m = s // 86400, s % 86400 // 3600, s % 3600 // 60
+    if d:
+        return f"{d}d {h}h"
+    if h:
+        return f"{h}h {m:02d}m"
+    if m:
+        return f"{m}m"
+    return f"{s}s"
+
+
+def fmt_n(n):
+    if n is None:
+        return "?"
+    for div, suf in ((1e9, "B"), (1e6, "M"), (1e3, "k")):
+        if n >= div:
+            return f"{n / div:.1f}{suf}"
+    return f"{n:.0f}"
+
+
+def bar(frac, width=20):
+    frac = max(0.0, min(1.0, frac))
+    full = int(round(frac * width))
+    return "█" * full + "░" * (width - full)
+
+
+def section(title):
+    print()
+    print(bold(title))
+
+
+def uptime_s():
+    with open("/proc/uptime") as f:
+        return float(f.read().split()[0])
+
+
+def docker_time(s):
+    """Docker's 'YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ' -> epoch seconds."""
+    try:
+        s = re.sub(r"\.(\d{6})\d*", r".\1", s).replace("Z", "+00:00")
+        return datetime.fromisoformat(s).timestamp()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# ---------------------------------------------------------------- collectors
+def meminfo():
+    m = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            k, v = line.split(":", 1)
+            m[k] = int(v.split()[0]) / 1048576  # GiB
+    return m
+
+
+def memwatch_thresholds():
+    t = {"MIN_AVAIL_GIB": 6, "WARN_AVAIL_GIB": 15}
+    try:
+        txt = open(MEMWATCH).read()
+        for k in t:
+            mm = re.search(rf"{k}=\$\{{{k}:-(\d+)\}}", txt)
+            if mm:
+                t[k] = int(mm.group(1))
+    except OSError:
+        pass
+    return t
+
+
+def gpu():
+    q = "name,temperature.gpu,clocks.sm,clocks.max.sm,power.draw,utilization.gpu,clocks_throttle_reasons.active"
+    out = run(["nvidia-smi", f"--query-gpu={q}", "--format=csv,noheader,nounits"]).strip()
+    if not out:
+        return None
+    v = [x.strip() for x in out.splitlines()[0].split(",")]
+    g = dict(zip(q.split(","), v))
+    apps = []
+    for line in run(["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory",
+                     "--format=csv,noheader,nounits"]).splitlines():
+        p = [x.strip() for x in line.split(",")]
+        if len(p) == 3 and p[0].isdigit():
+            apps.append({"pid": int(p[0]), "name": p[1], "mib": float(p[2]) if p[2].replace(".", "").isdigit() else 0})
+    g["apps"] = apps
+    return g
+
+
+THROTTLE = {0x2: "app-clocks", 0x4: "sw-power-cap", 0x8: "hw-slowdown", 0x10: "sync-boost",
+            0x20: "sw-thermal", 0x40: "hw-thermal", 0x80: "hw-power-brake", 0x100: "display-clock"}
+
+
+def throttle_text(hexstr):
+    try:
+        v = int(hexstr, 16)
+    except (TypeError, ValueError):
+        return dim("throttle n/a")
+    reasons = [n for bit, n in THROTTLE.items() if v & bit]
+    if reasons:
+        return red("throttled: " + ", ".join(reasons))
+    return green("not throttled") if not v & 0x1 else dim("idle")
+
+
+def container_of_pid(pid):
+    try:
+        txt = open(f"/proc/{pid}/cgroup").read()
+    except OSError:
+        return None
+    mm = re.search(r"docker[-/]([0-9a-f]{64})", txt)
+    return mm.group(1) if mm else None
+
+
+def units_state(units):
+    if not units:
+        return {}
+    props = "Id,ActiveState,SubState,UnitFileState,ActiveEnterTimestampMonotonic,NRestarts,ExecStop,Description"
+    out = run(["systemctl", "show", "-p", props, *units])
+    res, cur = {}, {}
+    for line in out.splitlines() + [""]:
+        if not line.strip():
+            if cur.get("Id"):
+                res[cur["Id"].removesuffix(".service")] = cur
+                res[cur["Id"]] = cur
+            cur = {}
+            continue
+        k, _, v = line.partition("=")
+        cur[k] = v
+    return res
+
+
+def model_units():
+    out = run(["systemctl", "list-unit-files", "ailab-vllm*.service", "--no-legend", "--plain"])
+    return sorted((l.split()[0].removesuffix(".service") for l in out.splitlines() if l.strip()), key=lambda u: (len(u), u))
+
+
+def parse_serve(cmd):
+    out = {}
+    if not cmd or "serve" not in cmd:
+        return out
+    i = cmd.index("serve")
+    if i + 1 < len(cmd) and not cmd[i + 1].startswith("--"):
+        out["model"] = cmd[i + 1]
+    j = i + 1
+    while j < len(cmd):
+        a = cmd[j]
+        if a.startswith("--"):
+            k = a[2:]
+            if "=" in k:
+                k, v = k.split("=", 1)
+                out[k] = v
+            elif j + 1 < len(cmd) and not cmd[j + 1].startswith("--"):
+                out[k] = cmd[j + 1]
+                j += 1
+            else:
+                out[k] = True
+        j += 1
+    return out
+
+
+def parse_metrics(text):
+    m = {}
+    for line in (text or "").splitlines():
+        if not line.startswith("vllm:"):
+            continue
+        try:
+            head, val = line.rsplit(" ", 1)
+            name = head.split("{", 1)[0]
+            m[name] = m.get(name, 0.0) + float(val)
+        except ValueError:
+            continue
+    return m
+
+
+def containers():
+    """All containers, with inspect details for running ones."""
+    rows = []
+    for line in run(["docker", "ps", "-a", "--format", "{{.ID}}\t{{.Names}}\t{{.State}}\t{{.Status}}\t{{.Label \"ailab.gpu\"}}"]).splitlines():
+        p = line.split("\t")
+        if len(p) == 5:
+            rows.append({"id": p[0], "name": p[1], "state": p[2], "status": p[3], "gpu": p[4] == "true"})
+    running = [r["id"] for r in rows if r["state"] == "running"]
+    if running:
+        try:
+            for d in json.loads(run(["docker", "inspect", *running]) or "[]"):
+                for r in rows:
+                    if d["Id"].startswith(r["id"]):
+                        r["full_id"] = d["Id"]
+                        r["cmd"] = d["Config"].get("Cmd") or []
+                        r["env"] = d["Config"].get("Env") or []
+                        r["started"] = docker_time(d["State"].get("StartedAt", ""))
+                        r["health"] = (d["State"].get("Health") or {}).get("Status")
+        except (json.JSONDecodeError, KeyError):
+            pass
+    return rows
+
+
+def model_dirs():
+    res = []
+    for d in sorted(glob.glob(os.path.join(MODELS_DIR, "*/"))):
+        d = d.rstrip("/")
+        cfg_path = os.path.join(d, "config.json")
+        if not os.path.isfile(cfg_path):
+            continue
+        try:
+            cfg = json.load(open(cfg_path))
+        except (OSError, json.JSONDecodeError):
+            cfg = {}
+        size = 0
+        for root, dirs, files in os.walk(d):
+            dirs[:] = [x for x in dirs if x != ".cache"]
+            for fn in files:
+                try:
+                    size += os.path.getsize(os.path.join(root, fn))
+                except OSError:
+                    pass
+        arch = (cfg.get("architectures") or ["?"])[0]
+        tc = cfg.get("text_config") or cfg
+        rev = None
+        for meta in glob.glob(os.path.join(d, ".cache/huggingface/download/*.metadata"))[:1]:
+            try:
+                rev = open(meta).readline().strip()[:12]
+            except OSError:
+                pass
+        name = os.path.basename(d)
+        res.append({
+            "name": name, "path": d, "gib": size / 2**30, "arch": arch,
+            "draft": "dflash" in arch.lower() or "dflash" in name.lower() or "draft" in arch.lower(),
+            "quant": (cfg.get("quantization_config") or {}).get("quant_method", "-"),
+            "ctx": tc.get("max_position_embeddings") or cfg.get("max_position_embeddings"),
+            "rev": rev,
+        })
+    return res
+
+
+def latest_bench(model):
+    best = None
+    for f in glob.glob(os.path.join(BENCH_DIR, "*.json")):
+        try:
+            r = json.load(open(f))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if r.get("model") != model or "busy" in r.get("label", ""):
+            continue
+        if best is None or os.path.getmtime(f) > best[0]:
+            best = (os.path.getmtime(f), r)
+    return best[1] if best else None
+
+
+def journal_count(args, pattern):
+    out = run(["journalctl", *args, "-b", "-q", "--no-pager", "--grep", pattern], timeout=20)
+    lines = [l for l in out.splitlines() if l.strip()]
+    return len(lines), (lines[-1][:15] if lines else None)
+
+
+def health():
+    nv, _ = journal_count(["-k"], "NV_ERR_NO_MEMORY")
+    oom, _ = journal_count(["-k"], "Out of memory: Killed|oom-kill")
+    warn, last_warn = journal_count(["-u", "ailab-memwatch"], "WARNING")
+    emerg, last_emerg = journal_count(["-u", "ailab-memwatch"], "EMERGENCY")
+    failed = [l.split()[0] for l in run(["systemctl", "--failed", "--no-legend", "--plain"]).splitlines() if l.strip()]
+    return {"nv": nv, "oom": oom, "warn": warn, "last_warn": last_warn, "emerg": emerg,
+            "last_emerg": last_emerg, "failed": failed}
+
+
+# ---------------------------------------------------------------- speed test
+SPEED_PROMPT = ("Write a Python function that parses an ISO-8601 duration string such as 'P3DT4H5M' "
+                "into seconds, with a docstring and three doctests. Output only the code.")
+
+
+def speed_test(host, port, model, key, max_tokens=256):
+    body = {"model": model, "messages": [{"role": "user", "content": "Request %08x. " % random.getrandbits(32) + SPEED_PROMPT}],
+            "max_tokens": max_tokens, "temperature": 0.6, "top_p": 0.95, "stream": True,
+            "stream_options": {"include_usage": True}, "chat_template_kwargs": {"enable_thinking": False}}
+    req = urllib.request.Request(f"http://{host}:{port}/v1/chat/completions", data=json.dumps(body).encode(),
+                                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+    t0 = time.perf_counter()
+    first = last = None
+    comp = 0
+    with urllib.request.urlopen(req, timeout=120) as r:
+        for raw in r:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data:") or line[5:].strip() == "[DONE]":
+                continue
+            ch = json.loads(line[5:])
+            if ch.get("usage"):
+                comp = ch["usage"].get("completion_tokens", comp)
+            for c in ch.get("choices") or []:
+                d = c.get("delta") or {}
+                if d.get("content") or d.get("reasoning_content") or d.get("reasoning"):
+                    now = time.perf_counter()
+                    first = first or now
+                    last = now
+    if not first or not last or last <= first or comp < 2:
+        return None
+    return {"ttft": first - t0, "tps": (comp - 1) / (last - first), "tokens": comp}
+
+
+# ---------------------------------------------------------------- report
+def report(args, cache):
+    key = api_key()
+    now = time.time()
+    up = uptime_s()
+    load = open("/proc/loadavg").read().split()[:3]
+
+    # header + network
+    ts = run(["tailscale", "status", "--json"])
+    try:
+        tsd = json.loads(ts)
+        ts_state = tsd.get("BackendState", "?")
+        ts_ip = (tsd.get("Self", {}).get("TailscaleIPs") or ["?"])[0]
+        ts_name = tsd.get("Self", {}).get("DNSName", "").rstrip(".")
+    except (json.JSONDecodeError, AttributeError):
+        ts_state, ts_ip, ts_name = "not running", "?", ""
+    lan = []
+    for line in run(["ip", "-4", "-o", "addr", "show", "scope", "global"]).splitlines():
+        p = line.split()
+        if len(p) > 3 and not re.match(r"(docker|br-|veth|tailscale)", p[1]):
+            lan.append(f"{p[3].split('/')[0]} ({p[1]})")
+    print(bold(socket.gethostname()) + dim("  ·  ") + time.strftime("%a %d %b %Y %H:%M %Z") +
+          dim("  ·  ") + f"up {fmt_dur(up)}" + dim("  ·  ") + f"load {' '.join(load)}")
+    ts_txt = green(ts_state) if ts_state == "Running" else red(ts_state)
+    print(f"Tailscale {ts_txt} {ts_ip} {dim(ts_name)}" + dim("  ·  ") + "LAN " + (", ".join(lan) or "none"))
+
+    # memory
+    m = meminfo()
+    tot, avail = m.get("MemTotal", 0), m.get("MemAvailable", 0)
+    swap_used = m.get("SwapTotal", 0) - m.get("SwapFree", 0)
+    th = memwatch_thresholds()
+    col = green if avail >= RESERVE_GIB else (yellow if avail >= th["WARN_AVAIL_GIB"] else red)
+    section("MEMORY")
+    print(f"  {bar((tot - avail) / tot if tot else 0)}  used {tot - avail:5.1f} of {tot:.1f} GiB" +
+          dim("  ·  ") + "available " + col(f"{avail:.1f} GiB") + dim("  ·  ") + f"swap {swap_used:.1f}/{m.get('SwapTotal', 0):.0f} GiB")
+    mw = units_state(["ailab-memwatch"]).get("ailab-memwatch", {})
+    mw_txt = green("active") if mw.get("ActiveState") == "active" else red(mw.get("ActiveState", "missing"))
+    if os.path.exists(EMERGENCY):
+        try:
+            why = open(EMERGENCY).read().strip()[:60]
+        except OSError:
+            why = "marker present"
+        emerg = red(f"EMERGENCY STOP in effect ({why}); see ailab-config/README.md to recover")
+    else:
+        emerg = green("no emergency")
+    print(f"  memwatch {mw_txt}" + dim(f"  (warn < {th['WARN_AVAIL_GIB']} GiB, stops models < {th['MIN_AVAIL_GIB']} GiB)") +
+          dim("  ·  ") + emerg)
+
+    # gpu
+    g = gpu()
+    section("GPU")
+    if g:
+        try:
+            t = float(g["temperature.gpu"])
+            tcol = green if t < 75 else (yellow if t < 85 else red)
+            temp = tcol(f"{t:.0f} °C")
+        except ValueError:
+            temp = "temp n/a"
+        try:
+            power = f"{float(g['power.draw']):.0f} W"
+        except ValueError:
+            power = "power n/a"
+        print(f"  {g['name']}" + dim("  ·  ") + temp + dim("  ·  ") + f"{g['clocks.sm']} MHz" + dim(f" (max {g['clocks.max.sm']})") +
+              dim("  ·  ") + power + dim("  ·  ") + f"util {g['utilization.gpu']}%" + dim("  ·  ") +
+              throttle_text(g["clocks_throttle_reasons.active"]))
+    else:
+        print("  " + red("nvidia-smi not answering"))
+
+    # disk
+    du = shutil.disk_usage("/")
+    dcol = green if du.free / du.total > 0.15 else red
+    print(f"  {dim('disk')} / {du.used / 2**40:.2f} of {du.total / 2**40:.2f} TiB used, " + dcol(f"{du.free / 2**40:.2f} TiB free"))
+
+    # services
+    cons = containers()
+    munits = model_units()
+    us = units_state(munits + CORE_UNITS)
+    unit_of_container = {}
+    section("SERVICES")
+    for u in munits + CORE_UNITS:
+        s = us.get(u)
+        if not s:
+            continue
+        act = s.get("ActiveState", "?")
+        acol = green if act == "active" else (yellow if act in ("activating", "reloading") else red)
+        try:
+            since = up - int(s.get("ActiveEnterTimestampMonotonic", "0")) / 1e6 if act == "active" else None
+        except ValueError:
+            since = None
+        restarts = s.get("NRestarts", "0")
+        mm = re.search(r"argv\[\]=\S*docker stop(?: -t \d+)? (\S+)", s.get("ExecStop", ""))
+        if mm:
+            unit_of_container[mm.group(1)] = u
+        extra = f"up {fmt_dur(since)}" if since is not None else ""
+        if restarts not in ("0", ""):
+            extra += "  " + yellow(f"restarts {restarts}")
+        print(f"  {u:22} {acol(f'{act:10}')} {dim(f'{s.get('UnitFileState', ''):9}')} {extra}")
+    for c in cons:
+        if c["gpu"] or c["state"] != "running":
+            continue
+        port = next((e.split("=", 1)[1] for e in c.get("env", []) if e.startswith("PORT=")), "")
+        h = c.get("health")
+        hcol = green if h in ("healthy", None) else red
+        print(f"  {c['name']:22} {hcol(f'{(h or 'running'):10}')} {dim('container'):9} up {fmt_dur(now - c['started']) if c.get('started') else '?'}" +
+              (dim(f"  :{port}") if port else ""))
+    stale = [c for c in cons if c["state"] != "running"]
+    if stale:
+        print("  " + dim("stopped containers: " + ", ".join(f"{c['name']} ({c['status']})" for c in stale)))
+
+    # models serving
+    gpu_c = [c for c in cons if c["gpu"] and c["state"] == "running"]
+    gpu_mem = {}
+    known_pids = set()
+    for a in (g or {}).get("apps", []):
+        cid = container_of_pid(a["pid"])
+        if cid:
+            gpu_mem[cid] = gpu_mem.get(cid, 0) + a["mib"] / 1024
+            known_pids.add(a["pid"])
+    servers = []
+    for c in gpu_c:
+        sv = parse_serve(c.get("cmd"))
+        host, port = sv.get("host", "127.0.0.1"), sv.get("port", "8000")
+        servers.append({"c": c, "sv": sv, "host": host, "port": port,
+                        "m0": parse_metrics(http(f"http://{host}:{port}/metrics"))})
+    servers.sort(key=lambda s: int(s["port"]) if str(s["port"]).isdigit() else 0)
+    t0 = time.time()
+    if servers:
+        time.sleep(1.0)
+    dt = time.time() - t0
+    in_use = set()
+    section(f"MODELS SERVING ({len(servers)})")
+    if not servers:
+        print("  " + yellow("no model containers running"))
+    for s in servers:
+        c, sv, host, port = s["c"], s["sv"], s["host"], s["port"]
+        m1 = parse_metrics(http(f"http://{host}:{port}/metrics"))
+        mod = http(f"http://{host}:{port}/v1/models", key)
+        served = sv.get("served-model-name") or os.path.basename(sv.get("model", "?"))
+        ctx = None
+        if mod:
+            try:
+                d0 = json.loads(mod)["data"][0]
+                served, ctx = d0.get("id", served), d0.get("max_model_len")
+            except (json.JSONDecodeError, KeyError, IndexError):
+                pass
+        age = now - c["started"] if c.get("started") else None
+        if mod:
+            state = green("ready")
+        elif age is not None and age < 1200:
+            state = yellow(f"loading ({fmt_dur(age)})")
+        else:
+            state = red("not responding")
+        for p in (sv.get("model"),):
+            if p:
+                in_use.add(os.path.basename(p.rstrip("/")))
+        spec = {}
+        try:
+            spec = json.loads(sv.get("speculative-config", "{}"))
+            if spec.get("model"):
+                in_use.add(os.path.basename(spec["model"].rstrip("/")))
+        except json.JSONDecodeError:
+            pass
+        unit = unit_of_container.get(c["name"])
+        gm = gpu_mem.get(c.get("full_id", ""), 0)
+        print(f"  {bold(served):30} :{port}  {state}  " + dim(f"{c['name']}" + (f" via {unit}" if unit else " (not under systemd)")))
+        line = [f"context {ctx:,} tokens" if ctx else None,
+                f"mem share {sv.get('gpu-memory-utilization', '?')}",
+                f"GPU {gm:.1f} GiB" if gm else None,
+                f"up {fmt_dur(age)}" if age else None]
+        print("    " + dim("  ·  ").join(x for x in line if x))
+        if m1:
+            run_n, wait_n = int(m1.get("vllm:num_requests_running", 0)), int(m1.get("vllm:num_requests_waiting", 0))
+            kv = m1.get("vllm:kv_cache_usage_perc", 0) * 100
+            kvcol = green if kv < 70 else (yellow if kv < 90 else red)
+            gen_now = max(0.0, (m1.get("vllm:generation_tokens_total", 0) - s["m0"].get("vllm:generation_tokens_total", 0)) / dt) if s["m0"] else 0
+            busy = (green(f"{run_n} running") if run_n else dim("idle")) + (yellow(f", {wait_n} waiting") if wait_n else "")
+            print("    " + busy + dim("  ·  ") + f"now {gen_now:.0f} tok/s" + dim("  ·  ") + "KV cache " + kvcol(f"{kv:.1f}%"))
+            reqs = m1.get("vllm:request_success_total", 0)
+            dec_t = m1.get("vllm:request_decode_time_seconds_sum", 0)
+            gen_tok = m1.get("vllm:request_generation_tokens_sum", 0)
+            ttft_n = m1.get("vllm:time_to_first_token_seconds_count", 0)
+            ttft = m1.get("vllm:time_to_first_token_seconds_sum", 0) / ttft_n if ttft_n else None
+            hits, queries = m1.get("vllm:prefix_cache_hits_total", 0), m1.get("vllm:prefix_cache_queries_total", 0)
+            acc, drafts = m1.get("vllm:spec_decode_num_accepted_tokens_total", 0), m1.get("vllm:spec_decode_num_drafts_total", 0)
+            pre = m1.get("vllm:num_preemptions_total", 0)
+            print("    " + dim("since start: ") + f"{fmt_n(reqs)} request{'s' if reqs != 1 else ''}" + dim("  ·  ") +
+                  f"{fmt_n(m1.get('vllm:prompt_tokens_total', 0))} prompt / {fmt_n(m1.get('vllm:generation_tokens_total', 0))} generated tokens")
+            stats = []
+            if dec_t > 0 and gen_tok:
+                stats.append(f"avg decode {gen_tok / dec_t:.0f} tok/s")
+            if ttft is not None:
+                stats.append(f"avg first token {ttft:.2f}s")
+            if queries:
+                stats.append(f"prefix cache hit {hits / queries * 100:.0f}%")
+            if drafts:
+                stats.append(f"{spec.get('method', 'draft')} accepts {acc / drafts:.2f}/step")
+            if pre:
+                stats.append(yellow(f"{fmt_n(pre)} preemptions (KV cache full)"))
+            if stats:
+                print("    " + dim("             ") + dim("  ·  ").join(stats))
+        b = latest_bench(served)
+        if b:
+            sm = b.get("summary", {})
+            print("    " + dim(f"benchmark {b.get('label')} ({b.get('started', '')[:16]}): ") +
+                  f"code {sm.get('code_tps')} · prose {sm.get('prose_tps')} tok/s · 4 at once {sm.get('concurrent_total_tps')} total" +
+                  dim(f" · tools {sm.get('tool_calls_ok')}"))
+        if args.speed and mod and key:
+            if m1 and m1.get("vllm:num_requests_running", 0) > 0:
+                print("    " + yellow("speed test skipped: model is busy"))
+            else:
+                try:
+                    r = speed_test(host, port, served, key)
+                    print("    " + bold("speed test now: ") + (f"{r['tps']:.1f} tok/s, first token {r['ttft']:.2f}s ({r['tokens']} tokens)" if r else "no result"))
+                except Exception as e:  # noqa: BLE001
+                    print("    " + red(f"speed test failed: {e}"))
+    others = [a for a in (g or {}).get("apps", []) if a["pid"] not in known_pids]
+    for a in others:
+        print("  " + yellow(f"other GPU process: pid {a['pid']} {a['name']} {a['mib'] / 1024:.1f} GiB (not in a container)"))
+
+    # models on disk
+    md = cache.get("models")
+    if md is None or now - cache.get("models_t", 0) > 300:
+        md = model_dirs()
+        cache["models"], cache["models_t"] = md, now
+    n_models = sum(1 for x in md if not x["draft"])
+    section(f"MODELS ON DISK ({n_models} models + {len(md) - n_models} drafts, {sum(x['gib'] for x in md):.0f} GiB in ~/models)")
+    for x in md:
+        arch = re.sub(r"(ForConditionalGeneration|ForCausalLM|Model)$", "", x["arch"])
+        status = green("● in use") if x["name"] in in_use else dim("○ idle  ")
+        kind = "draft" if x["draft"] else (f"ctx {x['ctx'] // 1024}k" if x["ctx"] else "")
+        print(f"  {status}  {x['name']:30} {x['gib']:6.1f} GiB  " + dim(f"{arch:16} {x['quant']:18} {kind:9} rev {x['rev'] or '?'}"))
+
+    # health
+    hl = cache.get("health")
+    if hl is None or now - cache.get("health_t", 0) > 60:
+        hl = health()
+        cache["health"], cache["health_t"] = hl, now
+    section("HEALTH (since boot)")
+    items = [
+        (green if not hl["nv"] else red)(f"GPU out-of-memory errors {hl['nv']}"),
+        (green if not hl["oom"] else red)(f"OOM kills {hl['oom']}"),
+        (green if not hl["emerg"] else red)(f"memwatch emergencies {hl['emerg']}") + (f" (last {hl['last_emerg']})" if hl["last_emerg"] else ""),
+        (green if not hl["warn"] else yellow)(f"memory warnings {hl['warn']}") + (dim(f" (last {hl['last_warn']})") if hl["last_warn"] else ""),
+        (green("no failed units") if not hl["failed"] else red("failed units: " + ", ".join(hl["failed"]))),
+    ]
+    print("  " + dim("  ·  ").join(items))
+
+
+def main():
+    ap = argparse.ArgumentParser(description="One-screen status of the ailab box (read-only).")
+    ap.add_argument("-w", "--watch", nargs="?", const=5, type=float, metavar="SECONDS",
+                    help="refresh every SECONDS (default 5)")
+    ap.add_argument("--speed", action="store_true", help="run a short live speed test on each idle model")
+    ap.add_argument("--no-color", action="store_true")
+    args = ap.parse_args()
+    if args.no_color:
+        C.on = False
+    cache = {}
+    if not args.watch:
+        report(args, cache)
+        return
+    args.speed = False
+    try:
+        while True:
+            sys.stdout.write("\033[H\033[2J")
+            report(args, cache)
+            print(dim(f"\nrefreshing every {args.watch:g}s, Ctrl-C to quit"))
+            time.sleep(args.watch)
+    except KeyboardInterrupt:
+        print()
+
+
+if __name__ == "__main__":
+    main()
